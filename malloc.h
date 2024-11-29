@@ -16,13 +16,13 @@ typedef struct heap
     int capacity;
 } heap;
 
-void *get_me_blocks(size_t size);
 void swap(mem_chunk **a, mem_chunk **b);
-void heap_insert(mem_chunk *chunk);
-mem_chunk *heap_remove();
 void heapify(int index);
+void heap_insert(mem_chunk *chunk);
+void *aligned_malloc(int size);
 void *my_malloc(int size);
+void coalesce_free_chunks();
 void my_free(void *ptr);
-void *my_realloc(void *ptr, size_t size);
+void *my_realloc(void *ptr, int size);
 
 #endif

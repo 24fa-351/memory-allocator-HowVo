@@ -1,41 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdalign.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 
-typedef struct __attribute__((aligned(8))) mem_chunk
-{
-    size_t size;
-    void *pointer_to_start;
-} mem_chunk;
-
-typedef struct heap
-{
-    mem_chunk **chunks;
-    size_t size;
-    size_t capacity;
-} heap;
+#include "malloc.h"
 
 #define BLOCK_SIZE 4096
 
-mem_chunk *free_list_chunks[50];
-heap free_list = {(mem_chunk **)&free_list_chunks, 0, 50};
+mem_chunk *free_list_chunks[100];
+heap free_list = {free_list_chunks, 0, 100};
 pthread_mutex_t mutex;
-
-void *get_me_blocks(size_t size)
-{
-    void *ptr = sbrk(0);
-    if (posix_memalign(&ptr, 8, BLOCK_SIZE) != 0)
-    {
-        return NULL;
-    }
-    if (sbrk(size) == (void *)-1)
-    {
-        return NULL;
-    }
-    return ptr;
-}
 
 void swap(mem_chunk **a, mem_chunk **b)
 {
@@ -44,12 +21,12 @@ void swap(mem_chunk **a, mem_chunk **b)
     *b = temp;
 }
 
-void heapify(size_t index)
+void heapify(int index)
 {
     pthread_mutex_lock(&mutex);
-    size_t left = 2 * index + 1;
-    size_t right = 2 * index + 2;
-    size_t smallest = index;
+    int left = 2 * index + 1;
+    int right = 2 * index + 2;
+    int smallest = index;
 
     if (left < free_list.size && free_list.chunks[left]->size < free_list.chunks[smallest]->size)
     {
@@ -87,76 +64,81 @@ void heap_insert(mem_chunk *chunk)
     pthread_mutex_unlock(&mutex);
 }
 
-mem_chunk *heap_remove()
+void *aligned_malloc(int size)
 {
-    pthread_mutex_lock(&mutex);
-    if (free_list.size == 0)
+    int alignment = alignof(mem_chunk);
+    void *ptr = aligned_alloc(alignment, size);
+    if (ptr == NULL)
     {
         return NULL;
     }
-
-    mem_chunk *chunk = free_list.chunks[0];
-    free_list.size--;
-    free_list.chunks[0] = free_list.chunks[free_list.size];
-    heapify(0);
-    pthread_mutex_unlock(&mutex);
-
-    return chunk;
+    return ptr;
 }
 
 void *my_malloc(int size)
 {
-    if (size <= 0)
-    {
-        return NULL;
-    }
-
     pthread_mutex_lock(&mutex);
-
-    for (size_t i = 0; i < free_list.size; i++)
-    {
-        if (free_list.chunks[i]->size >= size)
-        {
-            mem_chunk *chunk = free_list.chunks[i];
-            size_t leftover_size = chunk->size - size - sizeof(mem_chunk);
-
-            if (leftover_size > 0)
-            {
-                mem_chunk *leftover = (mem_chunk *)((char *)chunk + sizeof(mem_chunk) + size);
-                leftover->size = leftover_size;
-                leftover->pointer_to_start = (char *)leftover + sizeof(mem_chunk);
-                heap_insert(leftover);
-            }
-
-            chunk->size = size;
-            free_list.chunks[i] = free_list.chunks[--free_list.size];
-            heap_remove();
-            return (char *)chunk + sizeof(mem_chunk);
-        }
-    }
-
-    int total_size = size + sizeof(mem_chunk);
-    mem_chunk *new_chunk = (mem_chunk *)get_me_blocks(BLOCK_SIZE);
-    if (new_chunk == NULL)
+    if (size <= 0)
     {
         pthread_mutex_unlock(&mutex);
         return NULL;
     }
 
-    new_chunk->size = BLOCK_SIZE;
-    new_chunk->pointer_to_start = (char *)new_chunk + sizeof(mem_chunk);
+    int total_size = size + sizeof(mem_chunk);
+    mem_chunk *chunk = NULL;
 
-    size_t leftover_size = BLOCK_SIZE - total_size;
-    if (leftover_size > 0)
+    for (int i = 0; i < free_list.size; i++)
     {
-        mem_chunk *leftover = (mem_chunk *)((char *)new_chunk + total_size);
-        leftover->size = leftover_size;
-        leftover->pointer_to_start = (char *)leftover + sizeof(mem_chunk);
-        heap_insert(leftover);
+        if (free_list.chunks[i]->size >= total_size)
+        {
+            chunk = free_list.chunks[i];
+            free_list.chunks[i] = free_list.chunks[free_list.size - 1];
+            free_list.size--;
+            break;
+        }
     }
 
+    if (chunk == NULL)
+    {
+        chunk = (mem_chunk *)sbrk(BLOCK_SIZE);
+        if (chunk == (void *)-1)
+        {
+            pthread_mutex_unlock(&mutex);
+            return NULL;
+        }
+        chunk->size = BLOCK_SIZE;
+    }
+
+    if (chunk->size - total_size >= sizeof(mem_chunk))
+    {
+        mem_chunk *new_chunk = (mem_chunk *)((char *)chunk + total_size);
+        new_chunk->size = chunk->size - total_size;
+        heap_insert(new_chunk);
+    }
+
+    chunk->size = size;
     pthread_mutex_unlock(&mutex);
-    return new_chunk->pointer_to_start;
+    return (void *)((char *)chunk + sizeof(mem_chunk));
+}
+
+void coalesce_free_chunks()
+{
+    for (int i = 0; i < free_list.size - 1; i++)
+    {
+        mem_chunk *current = free_list.chunks[i];
+        mem_chunk *next = free_list.chunks[i + 1];
+
+        if ((char *)current + current->size + sizeof(mem_chunk) == (char *)next)
+        {
+            current->size += next->size + sizeof(mem_chunk);
+            for (int j = i + 1; j < free_list.size - 1; j++)
+            {
+                free_list.chunks[j] = free_list.chunks[j + 1];
+            }
+            free_list.size--;
+            i--;
+        }
+    }
 }
 
 void my_free(void *ptr)
@@ -169,33 +151,45 @@ void my_free(void *ptr)
 
     mem_chunk *chunk = (mem_chunk *)((char *)ptr - sizeof(mem_chunk));
     heap_insert(chunk);
+
+    coalesce_free_chunks();
+
     pthread_mutex_unlock(&mutex);
 }
 
-void *my_realloc(void *ptr, size_t size)
+void *my_realloc(void *ptr, int new_size)
 {
-    pthread_mutex_lock(&mutex);
-    if (ptr == NULL)
-    {
-        return my_malloc(size);
-    }
-
-    if (size == 0)
+    if (new_size <= 0)
     {
         my_free(ptr);
         return NULL;
     }
 
-    mem_chunk *old_chunk = (mem_chunk *)((char *)ptr - sizeof(mem_chunk));
-    size_t old_size = old_chunk->size;
+    if (ptr == NULL)
+    {
+        return my_malloc(new_size);
+    }
 
-    void *new_ptr = my_malloc(size);
+    pthread_mutex_lock(&mutex);
+
+    mem_chunk *old_chunk = (mem_chunk *)((char *)ptr - sizeof(mem_chunk));
+    int old_size = old_chunk->size;
+
+    if (new_size <= old_size)
+    {
+        old_chunk->size = new_size;
+        pthread_mutex_unlock(&mutex);
+        return ptr;
+    }
+
+    void *new_ptr = my_malloc(new_size);
     if (new_ptr == NULL)
     {
+        pthread_mutex_unlock(&mutex);
         return NULL;
     }
 
-    size_t copy_size = old_size < size ? old_size : size;
+    int copy_size = old_size < new_size ? old_size : new_size;
     memmove(new_ptr, ptr, copy_size);
 
     my_free(ptr);
